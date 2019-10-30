@@ -194,6 +194,7 @@ class CarlaSimulator(object):
             im.save("/home/foxfi/data/tesla.png")
         if transform is not None:
             self.camera.set_transform(transform)
+        # FIXME: async call to `set_transform`, needed synchronized call
         for _ in range(2):
             self.frame = self.world.tick()
         self.last_image = self._retrieve_data(self.image_queue, timeout)

@@ -264,7 +264,7 @@ class CloneNetwork(object):
             self.global_step = tf.Variable(0, trainable=False)
             # FIXME: temporary, a restart lr decay might be prefered (use placeholder for lr)
             learning_rate = tf.train.exponential_decay(self.lr, self.global_step,
-                                                       10, 0.9, staircase=True)
+                                                       100, 0.9, staircase=True)
             self.optimizer_theta = tf.train.MomentumOptimizer(learning_rate, momentum=self.momentum)
 
             update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, scope=self.scope_name)
@@ -283,9 +283,9 @@ class Attacker(object):
     def __init__(self, simulator, target_model, session, save_dir, display_info=True,
                  bounds=(0, 255),
                  camous_size=16, iters=50, num_init_camous=50, num_max_camous=400,
-                 theta_max_num_ct_per_inneriter=128, theta_random_ct=True, theta_random_ct_sample=True,
+                 theta_max_num_ct_per_inneriter=1024, theta_random_ct=True, theta_random_ct_sample=True,
                  camous_std=5, num_add_camous=20,
-                 batch_size=32, theta_optimize_iters=1, theta_early_stop_window=2, c_optimize_iters=10,
+                 batch_size=32, theta_optimize_iters=20, theta_early_stop_window=2, c_optimize_iters=10,
                  lr_c=4.0, pgd=True,
                  clone_net_cfg=None):
         # long-term TODO: restrict camous not to be too noisy
@@ -412,6 +412,7 @@ class Attacker(object):
                 loss_rec_meter.reset()
                 loss_l2_meter.reset()
                 for i_camous, camous, i_trans, transform, remain in self.ct_data_gen():
+                    # FIXME: the images can be cached instead of re-simulated using CARLA each time
                     image = self.simulator.get_image(camous, transform)
                     detbox = self.target_model.get_detbox(image)
                     if self.display_info:
@@ -428,6 +429,10 @@ class Attacker(object):
                     if detbox.score < 0.5:
                         # mis-detection, might result in wrong foreground/background crop, might be misleading
                         continue
+                    # FIXME: THIS is WRONG now!!! Now I use the image rendered using car with camous to crop out the
+                    # "foreground" and "background". But, the original car and corresponding detbox should be used.
+                    # As this is not related to the camous, only related to the camera transform (15 different transforms now),
+                    # we can do this processing in advance -- Calculate out 15 transform encoding in advance.
                     transform_encoding = self.get_transform_encoding(transform, image, detbox)
                     transform_encodings.append(transform_encoding)
                     score_label_batch = np.concatenate([score_label_batch, [[detbox.score]]], axis=0)
