@@ -183,7 +183,7 @@ class CarlaSimulator(object):
         self.client.apply_batch([carla.command.DestroyActor(self.ego_vehicle_id)])
         self.world.apply_settings(self.ori_settings)
 
-    def get_image(self, camous, transform, timeout=2, ori=False):
+    def get_image(self, camous, transform, timeout=2, ori=False, tick=2):
         if ori:
             # use original texture
             assert camous is None
@@ -195,12 +195,14 @@ class CarlaSimulator(object):
         if transform is not None:
             self.camera.set_transform(transform)
         # FIXME: async call to `set_transform`, needed synchronized call
-        for _ in range(2):
+        for _ in range(tick):
             self.frame = self.world.tick()
+        # self.frame = self.world.tick()
+        # _snapshot = self.world.wait_for_tick()
+        # self.frame = _snapshot.frame
         self.last_image = self._retrieve_data(self.image_queue, timeout)
         # to render on pygame display
         self.surface = pygame.surfarray.make_surface(self.last_image.swapaxes(0, 1))
-        # self.world.wait_for_tick()
         self.render(camous)
         # while self.last_image is None:
         #     continue
@@ -210,9 +212,12 @@ class CarlaSimulator(object):
         while True:
             data, frame = sensor_queue.get(timeout=timeout)
             if frame == self.frame:
-                return data
+                return data.copy()
 
-def _save_image(im, path):
+def _save_image(im, path, root_path='./tmp_image'):
+    if not os.path.exists(root_path):
+        os.mkdir(root_path)
+    path = os.path.join(root_path, path)
     Image.fromarray(im.astype(np.uint8)).save(path)
 
 if __name__ == '__main__':
