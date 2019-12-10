@@ -184,11 +184,15 @@ class CarlaSimulator(object):
         self.world.apply_settings(self.ori_settings)
 
     def get_image(self, camous, transform, timeout=2, ori=False, tick=2):
+        # FIXME: do not use a single path..
+        # or use docker to isolate the filesystem
         if ori:
             # use original texture
             assert camous is None
             if os.path.exists("/home/foxfi/data/tesla.png"):
                 os.unlink("/home/foxfi/data/tesla.png")
+            # im = Image.fromarray(np.zeros((16, 16, 3), dtype=np.uint8))
+            # im.save("/home/foxfi/data/tesla.png")
         if camous is not None:
             im = Image.fromarray(camous.astype(np.uint8))
             im.save("/home/foxfi/data/tesla.png")
@@ -214,10 +218,10 @@ class CarlaSimulator(object):
             if frame == self.frame:
                 return data.copy()
 
-def _save_image(im, path, root_path='./tmp_image'):
+def _save_image(im, path):
+    root_path = os.path.dirname(path)
     if not os.path.exists(root_path):
         os.mkdir(root_path)
-    path = os.path.join(root_path, path)
     Image.fromarray(im.astype(np.uint8)).save(path)
 
 if __name__ == '__main__':

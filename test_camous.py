@@ -7,6 +7,7 @@ from config import cfg, config
 
 import os
 import random
+import shutil
 import argparse
 from collections import OrderedDict
 from functools import partial
@@ -42,12 +43,18 @@ class AvgMeter(object):
         self.avg = 0.
         self.recent = 0.
         self.n = 0
+        self.min = None
+        self.max = None
 
     def update(self, value, n=1):
         self.sum += value * n
         self.n += n
         self.avg = self.sum / self.n
         self.recent = value
+        if self.min is None or value < self.min:
+            self.min = value
+        if self.max is None or value < self.max:
+            self.max = value
 
 class FasterRCNNModel(object):
     def __init__(self, session):
@@ -120,7 +127,7 @@ class FasterRCNNModel(object):
         return box
 
 class CloneNetwork(object):
-    def __init__(self, session, camous_size=16, momentum=0.9, l2_reg=0.01, back_shape=64, fore_shape=64,
+    def __init__(self, session, camous_size=16, momentum=0.9, l2_reg=0.001, back_shape=64, fore_shape=64,
                  use_bn=True, batch_norm_momentum=0.997):
         self.sess = session
 
@@ -143,6 +150,9 @@ class CloneNetwork(object):
     def save(self, path):
         self.saver.save(self.sess, path)
 
+    def load(self, path):
+        self.saver.restore(self.sess, path)
+
     def build_placeholders(self):
         self.lr = tf.placeholder(tf.float32, shape=[])
         self.camous_input = tf.placeholder(tf.float32, shape=[None, None, None, 3])
@@ -150,7 +160,6 @@ class CloneNetwork(object):
         self.fore_input = tf.placeholder(tf.float32, shape=[None, self.fore_shape, self.fore_shape, 3])
         self.loss_weight = tf.placeholder(tf.float32, shape=[None, 1])
         self.label = tf.placeholder(tf.float32, shape=[None, 1])
-        self.batch_size_placeholder = tf.placeholder(tf.int32, shape=[1])
         self.training = tf.placeholder(tf.bool, shape=[])
 
     def _handle_trans_inputs(self, trans_inputs):
@@ -174,8 +183,7 @@ class CloneNetwork(object):
             self.camous_input: camous_inputs,
             self.back_input: back_inputs,
             self.fore_input: fore_inputs,
-            #            self.label: score_label,
-            self.batch_size_placeholder: [len(score_label)],
+            self.label: score_label,
             self.loss_weight: [[1.]],
             self.training: False
         }
@@ -250,16 +258,25 @@ class CloneNetwork(object):
             merge = self.batch_norm(merge)
             merge = tf.nn.relu(merge)
             merge = layers_lib.flatten(merge)
+            # merge = layers_lib.fully_connected(merge, 1, activation_fn=tf.sigmoid)
             merge = layers_lib.fully_connected(merge, 1, activation_fn=None)
+
+            # the difference between actual detection score and the clone network predicted score
+            # EPS = 1e-5
+            # label very small (-> 0) or very large (->1), merge must be ->0 and ->1
+            # self.loss_rec = tf.reduce_mean(- merge * tf.log(label + EPS) - (1 - merge) * tf.log(1 - label + EPS))
+            # merge very small (-> 0) or very large (->1), label must be ->0 and ->1
+            # self.loss_rec = tf.reduce_mean(- label * tf.log(merge + EPS) - (1 - label) * tf.log(1 - merge + EPS))
             self.loss_rec = tf.losses.sigmoid_cross_entropy(label, merge, weights=self.loss_weight)
             self.loss_reg = tf.losses.get_regularization_loss(scope=self.scope_name)
-            zero_label = tf.reshape(tf.tile(tf.zeros(label.shape[1], label.dtype), multiples=self.batch_size_placeholder),
-                                    (-1, label.shape[1]))
 
+            zero_label = tf.zeros([tf.shape(x)[0], 1], tf.float32)
             loss_c = tf.losses.sigmoid_cross_entropy(zero_label, merge)
+            # loss_c = tf.reduce_mean(- tf.log(1 - merge + EPS)) # very strange, grad=0
+
             self.merge = merge
             self.loss_theta = self.loss_rec + self.loss_reg
-            self.loss_c = tf.reduce_mean(loss_c)
+            self.loss_c = loss_c
 
             # optimizers, train steps, gradients
             self.camous_grads = tf.gradients(loss_c, inputs[0])
@@ -280,7 +297,7 @@ class CloneNetwork(object):
 
 
 class ExpDecayLrScheduler(object):
-    def __init__(self, base_lr, decay_alter_every, decay_alter_rate, decay_epoch_every, decay_epoch_rate):
+    def __init__(self, base_lr, decay_alter_every=-1, decay_alter_rate=1.0, decay_epoch_every=-1, decay_epoch_rate=1.0):
         self.base_lr = base_lr
         self.decay_alter_every = decay_alter_every
         self.decay_alter_rate = decay_alter_rate
@@ -302,9 +319,16 @@ class ExpDecayLrScheduler(object):
 class Attacker(object):
     def __init__(self, simulator, target_model, session, save_dir, display_info=False,
                  bounds=(0, 255),
-                 camous_size=16, iters=50, num_init_camous=50, num_max_camous=400,
-                 theta_max_num_ct_per_inneriter=1024, theta_random_ct=True, theta_random_ct_sample=True,
+                 camous_size=16,
+                 # alternation num
+                 iters=50,
+                 # camous number
+                 num_init_camous=50, num_max_camous=400,
+                 # how to produce camous transform in each theta epoch
+                 theta_max_num_ct_per_innerepoch=1024, theta_random_ct=True, theta_random_ct_sample=True,
+                 # newly added camous each alternation
                  camous_std=5, num_add_camous=20,
+                 # theta optimization hyperparameters
                  batch_size=32, theta_optimize_epochs=20, theta_early_stop_window=2,
                  lr_theta_type="ExpDecay",
                  lr_theta_cfg={
@@ -314,17 +338,16 @@ class Attacker(object):
                      "decay_epoch_every": -1,
                      "decay_epoch_rate": 1.0
                  },
-                 # camous optimization
-                 c_optimize_iters=10, lr_c=4.0, pgd=True,
+                 # camous optimization hyperparameters
+                 c_optimize_iters=20, lr_c=2.0, pgd=True,
                  clone_net_cfg=None):
         # long-term TODO: restrict camous not to be too noisy
         self.target_model = target_model
+        # TODO: support multiple simulator in multiple thread, also backup
         self.simulator = simulator
         self.session = session
         self.save_dir = save_dir
         self.display_info = display_info
-        if not os.path.exists(self.save_dir):
-            os.makedirs(self.save_dir)
         self.log_file = open(os.path.join(save_dir, "attack.log"), "w")
 
         # configs
@@ -336,7 +359,7 @@ class Attacker(object):
         self.batch_size = batch_size
         self.theta_optimize_epochs = theta_optimize_epochs
         self.c_optimize_iters = c_optimize_iters
-        self.theta_max_num_ct_per_inneriter = theta_max_num_ct_per_inneriter
+        self.theta_max_num_ct_per_innerepoch = theta_max_num_ct_per_innerepoch
         self.theta_random_ct = theta_random_ct
         self.theta_random_ct_sample = theta_random_ct_sample
         self.camous_std = camous_std
@@ -377,10 +400,12 @@ class Attacker(object):
         self.i_trans2detbox = []
         self.image_list = []
         self.transform_encodings = []
+        self.clean_scores = []
         for i, transform in enumerate(self.transforms):
             image = self.simulator.get_image(None, transform, ori=True)
             self.image_list.append(image)
             detbox = self.target_model.get_detbox(image)
+            self.clean_scores.append(detbox.score)
             self.i_trans2detbox.append(detbox)
             self.transform_encodings.append(self.get_transform_encoding(transform, image, detbox))
             # plot box for manual check
@@ -389,8 +414,14 @@ class Attacker(object):
             image_with_det[int(detbox.y):int(detbox.y1), int(detbox.x1), :] = [255, 0, 0]
             image_with_det[int(detbox.y), int(detbox.x):int(detbox.x1), :] = [255, 0, 0]
             image_with_det[int(detbox.y1), int(detbox.x):int(detbox.x1), :] = [255, 0, 0]
-            _save_image(image, "init_fixbox_{:d}.jpg".format(i))
-            _save_image(image_with_det, "init_fixbox_withdet_{:d}.jpg".format(i))
+            _save_image(image, os.path.join(self.save_dir, "init_fixbox_{:d}.jpg".format(i)))
+            _save_image(image_with_det,
+                        os.path.join(self.save_dir, "init_fixbox_withdet_{:d}.jpg".format(i)))
+            _save_image(self.transform_encodings[-1][0],
+                        os.path.join(self.save_dir, "transform_encoding_{}_back.jpg".format(i)))
+            _save_image(self.transform_encodings[-1][1],
+                        os.path.join(self.save_dir, "transform_encoding_{}_fore.jpg".format(i)))
+        print("Clean detection scores for {} transforms: ".format(len(self.transforms)), self.clean_scores)
 
     def ct_data_gen(self, pre_sim=False):
         # generate camous, transform data pair randomly or sequentially
@@ -401,10 +432,10 @@ class Attacker(object):
             random.shuffle(camous_range)
             random.shuffle(transform_range)
 
-        if self.theta_max_num_ct_per_inneriter is None:
+        if self.theta_max_num_ct_per_innerepoch is None:
             total_to_gen = self._num_transforms * num_camous
         else:
-            total_to_gen = self.theta_max_num_ct_per_inneriter
+            total_to_gen = self.theta_max_num_ct_per_innerepoch
 
         i_camous_list = []
         i_transform_list = []
@@ -423,9 +454,9 @@ class Attacker(object):
 
         num_gened = 0
         while num_gened < total_to_gen:
-            num_gened += 1
             i_camous = i_camous_list[num_gened]
             i_transform = i_transform_list[num_gened]
+            num_gened += 1
             yield i_camous, self.camous_history[i_camous], i_transform, self.transforms[i_transform], total_to_gen - num_gened
         return
 
@@ -447,8 +478,11 @@ class Attacker(object):
         return ["score: {:.3f}".format(detbox.score)] + \
             ["{}: {:.3f} (avg {:.3f})".format(n, m.recent, m.avg) for n, m in loss_meters.items()] + addis
 
-    def run_attack(self):
+    def run_attack(self, load_clone_net=None):
         self.fix_detbox()
+
+        if load_clone_net is not None:
+            self.clone_net.load(load_clone_net)
 
         for _ in range(self.num_init_camous):
             # generate init camouflages
@@ -460,102 +494,110 @@ class Attacker(object):
         num_accum = 0
         for i_iter in range(self.iters):
             self.print("Alternate {}".format(i_iter))
-            # ---- ALTERNATION 1: tune clone network using current camous history ----
-            num_updates = 0
-            loss_v_meter = AvgMeter()
-            loss_rec_meter = AvgMeter()
-            loss_l2_meter = AvgMeter()
-            camous_batch, transform_encodings, score_label_batch, loss_weight_batch = np.zeros(
-                (0, self.camous_size, self.camous_size, 3)), [], np.zeros((0, 1)), np.zeros((0, 1))
-            best_inner_i = 0
-            best_inner_loss = np.inf
-            start_time = time.time()
-            for i_inner in range(self.theta_optimize_epochs):
-                cur_lr = self.lr_theta_scheduler.get_lr(i_iter, i_inner)
-                loss_v_meter.reset()
-                loss_rec_meter.reset()
-                loss_l2_meter.reset()
-                for i_camous, camous, i_trans, transform, remain in self.ct_data_gen():
-                    # get the transform encoding
-                    transform_encoding = self.transform_encodings[i_trans]
-                    transform_encodings.append(transform_encoding)
+            if i_iter == 0 and load_clone_net is not None:
+                # if load clone network from disk, skip the clone net training in the first alternation
+                pass
+            else:
+                # ---- ALTERNATION 1: tune clone network using current camous history ----
+                num_updates = 0
+                loss_v_meter = AvgMeter()
+                loss_rec_meter = AvgMeter()
+                loss_l2_meter = AvgMeter()
+                det_score_meter = AvgMeter()
+                camous_batch, transform_encodings, score_label_batch, loss_weight_batch = np.zeros(
+                    (0, self.camous_size, self.camous_size, 3)), [], np.zeros((0, 1)), np.zeros((0, 1))
+                best_inner_i = 0
+                best_inner_loss = np.inf
+                start_time = time.time()
+                for i_inner in range(self.theta_optimize_epochs):
+                    cur_lr = self.lr_theta_scheduler.get_lr(i_iter, i_inner)
+                    loss_v_meter.reset()
+                    loss_rec_meter.reset()
+                    loss_l2_meter.reset()
+                    det_score_meter.reset()
+                    for i_camous, camous, i_trans, transform, remain in self.ct_data_gen():
+                        # get the transform encoding
+                        transform_encoding = self.transform_encodings[i_trans]
+                        transform_encodings.append(transform_encoding)
 
-                    # get the camera-captured image with camous
-                    image = self.simulator.get_image(camous, transform)
-                    detbox = self.target_model.get_detbox(image)
-                    score_label_batch = np.concatenate([score_label_batch, [[detbox.score]]], axis=0)
-                    camous_batch = np.concatenate([camous_batch, [camous]], axis=0)
-                    loss_weight_batch = np.concatenate([loss_weight_batch, [[self.camous_weights[i_camous]]]], axis=0)
-                    # TODO: move data gen to another thread, now gpu util is ver low...
-                    # need multiple simulator instances to generate data faster
-                    num_accum += 1
+                        # get the camera-captured image with camous
+                        image = self.simulator.get_image(camous, transform)
+                        detbox = self.target_model.get_detbox(image)
+                        score_label_batch = np.concatenate([score_label_batch, [[detbox.score]]], axis=0)
+                        camous_batch = np.concatenate([camous_batch, [camous]], axis=0)
+                        loss_weight_batch = np.concatenate([loss_weight_batch, [[self.camous_weights[i_camous]]]], axis=0)
+                        # TODO: move data gen to another thread, now gpu util is ver low...
+                        # need multiple simulator instances to generate data faster
+                        num_accum += 1
 
-                    if self.display_info:
-                        # render the detbox and info onto the display
-                        self.simulator.render_info(
-                            [[detbox.x, detbox.y, detbox.w, detbox.h]] if detbox.score > 0.5 else [],
-                            self._get_display_info(
-                                detbox,
-                                OrderedDict(zip(["loss_theta", "loss_rec", "loss_reg"],
-                                                [loss_v_meter, loss_rec_meter, loss_l2_meter])),
-                                addis=["Alter {} iter {} batch {}".format(i_iter, i_inner, num_updates), "camous {} trans {}".format(i_camous, i_trans)]))
-                    # also render and print the clone network inputs (transform_encoding, camous) and the  loss infos (including running avg)
-                    # all onto another pygame window.
+                        if self.display_info:
+                            # render the detbox and info onto the display
+                            self.simulator.render_info(
+                                [[detbox.x, detbox.y, detbox.w, detbox.h]] if detbox.score > 0.5 else [],
+                                self._get_display_info(
+                                    detbox,
+                                    OrderedDict(zip(["loss_theta", "loss_rec", "loss_reg"],
+                                                    [loss_v_meter, loss_rec_meter, loss_l2_meter])),
+                                    addis=["Alter {} epoch {} batch {}".format(i_iter, i_inner, num_updates), "camous {} trans {}".format(i_camous, i_trans)]))
+                        # also render and print the clone network inputs (transform_encoding, camous) and the  loss infos (including running avg)
+                        # all onto another pygame window.
 
-                    # finish accumulating a batch, run update
-                    if num_accum == self.batch_size:
-                        assert len(camous_batch) == self.batch_size
+                        # finish accumulating a batch, run update
+                        if num_accum == self.batch_size:
+                            assert len(camous_batch) == self.batch_size
+                            loss_v, loss_rec, loss_l2 = self.clone_net.accumulate_grads(camous_batch, transform_encodings, score_label_batch,
+                                                                                  loss_weight=loss_weight_batch)
+                            loss_v_meter.update(loss_v, self.batch_size)
+                            loss_rec_meter.update(loss_rec, self.batch_size)
+                            loss_l2_meter.update(loss_l2, self.batch_size)
+                            det_score_meter.update(score_label_batch.mean())
+                            self.clone_net.step(lr=cur_lr)
+                            num_accum = 0
+                            num_updates += 1
+                            camous_batch, transform_encodings, score_label_batch, loss_weight_batch = np.zeros((0, self.camous_size, self.camous_size, 3)), [], np.zeros((0, 1)), np.zeros((0, 1))
+                            self.print("[Optimize Theta] Alter {}/Epoch {}/Batch {} lr: {:.3f}. loss: {:.3f} {:.3f} {:.3f}".format(
+                                i_iter, i_inner, num_updates, cur_lr, loss_v, loss_rec, loss_l2))
+                    # update using the remaining data that do not make up a whole batch
+                    if num_accum > 0:
                         loss_v, loss_rec, loss_l2 = self.clone_net.accumulate_grads(camous_batch, transform_encodings, score_label_batch,
-                                                                              loss_weight=loss_weight_batch)
-                        loss_v_meter.update(loss_v, self.batch_size)
-                        loss_rec_meter.update(loss_rec, self.batch_size)
-                        loss_l2_meter.update(loss_l2, self.batch_size)
+                                                                                    loss_weight=loss_weight_batch)
+                        loss_v_meter.update(loss_v, num_accum)
+                        loss_rec_meter.update(loss_rec, num_accum)
+                        loss_l2_meter.update(loss_l2, num_accum)
+                        det_score_meter.update(score_label_batch.mean())
                         self.clone_net.step(lr=cur_lr)
                         num_accum = 0
                         num_updates += 1
+                        self.print("[Optimize Theta] Alter {}/Epoch {}/Batch {} lr: {:.3f}. loss: {:.3f} {:.3f} {:.3f}".format(
+                            i_iter, i_inner, num_updates, cur_lr, loss_v, loss_rec, loss_l2))
                         camous_batch, transform_encodings, score_label_batch, loss_weight_batch = np.zeros((0, self.camous_size, self.camous_size, 3)), [], np.zeros((0, 1)), np.zeros((0, 1))
-                        self.print("[Optimize Theta] Epoch/Batch {}/{}. lr: {:.3f}. loss: {:.3f} {:.3f} {:.3f}".format(
-                            i_inner, num_updates, cur_lr, loss_v, loss_rec, loss_l2))
-                if num_accum > 0:
-                    loss_v, loss_rec, loss_l2 = self.clone_net.accumulate_grads(camous_batch, transform_encodings, score_label_batch,
-                                                                                loss_weight=loss_weight_batch)
-                    loss_v_meter.update(loss_v, num_accum)
-                    loss_rec_meter.update(loss_rec, num_accum)
-                    loss_l2_meter.update(loss_l2, num_accum)
-                    self.clone_net.step(lr=cur_lr)
-                    num_accum = 0
-                    num_updates += 1
-                    self.print("[Optimize Theta] Epoch/Batch {}/{}. lr: {:.3f}. loss: {:.3f} {:.3f} {:.3f}".format(
-                        i_inner, num_updates, cur_lr, loss_v, loss_rec, loss_l2))
-                    camous_batch, transform_encodings, score_label_batch, loss_weight_batch = np.zeros((0, self.camous_size, self.camous_size, 3)), [], np.zeros((0, 1)), np.zeros((0, 1))
-                self.print("[Optimize Theta] Epoch {} total batches {} (bs={}): mean loss: {:.3f} {:.3f} {:.3f}".format(
-                    i_inner, num_updates, self.batch_size, loss_v_meter.avg, loss_rec_meter.avg, loss_l2_meter.avg))
-                num_updates = 0
-                if loss_v_meter.avg < best_inner_loss:
-                    best_inner_i = i_inner
-                    best_inner_loss = loss_v_meter.avg
-                if i_inner - best_inner_i >= self.theta_early_stop_window:
-                    print("mean loss does not decay for {} inner theta optimization iters, early-stop optimize theta".format(self.theta_early_stop_window))
-                    break
-            print("time for theta:", time.time() - start_time)
 
-            # save the current clone net
-            save_path = os.path.join(self.save_dir, "clone_net_{}.ckpt".format(i_iter))
-            self.print("Save the current clone net to {}".format(save_path))
-            self.clone_net.save(save_path)
+                    self.print("[Optimize Theta] Alter {}/Epoch {} total batches {} (bs={}): mean loss: {:.3f} {:.3f} {:.3f}; min det score using current camous set: {:.3f} (mean {:.3f})".format(
+                        i_iter, i_inner, num_updates, self.batch_size, loss_v_meter.avg, loss_rec_meter.avg, loss_l2_meter.avg, det_score_meter.min, det_score_meter.avg))
+                    num_updates = 0
+                    if loss_v_meter.avg < best_inner_loss:
+                        best_inner_i = i_inner
+                        best_inner_loss = loss_v_meter.avg
+                    if i_inner - best_inner_i >= self.theta_early_stop_window:
+                        print("mean loss does not decay for {} inner theta optimization iters, early-stop optimize theta".format(self.theta_early_stop_window))
+                        break
+                print("time for theta:", time.time() - start_time)
+
+                # save the current clone net
+                save_path = os.path.join(self.save_dir, "clone_net_{}.ckpt".format(i_iter))
+                self.print("Save the current clone net to {}".format(save_path))
+                self.clone_net.save(save_path)
 
             # ---- ALTERNATION 2: attack using current clone network ----
             new_camous = self.camous_history[-1].copy()
             # camous_trace = [] # the camous update trace
             self.simulator.render_camous_trace(new_camous, index=0, clear=True)
+            init_loss_theta_v = None
             for i_inner in range(self.c_optimize_iters):
                 transform_encodings, score_label_batch = [], np.zeros((0, 1))
                 avg_score = 0.
                 misdetect = 0
                 for i_trans, transform in enumerate(self.transforms):
-                    # get the transform encoding
-                    transform_encoding = self.transform_encodings[i_trans]
-
                     # get the camera-captured image with camous
                     image = self.simulator.get_image(new_camous, transform)
                     detbox = self.target_model.get_detbox(image)
@@ -564,7 +606,6 @@ class Attacker(object):
                     misdetect += detbox.score < 0.5
                     score_label_batch = np.concatenate([score_label_batch, [[detbox.score]]], axis=0)
                     avg_score += detbox.score
-                    transform_encodings.append(self.get_transform_encoding(transform, image, detbox))
                     # render the detbox and info onto the display
                     if self.display_info:
                         self.simulator.render_info(
@@ -575,7 +616,18 @@ class Attacker(object):
                                 addis=["Alter {} c iter {} trans {}".format(i_iter, i_inner, i_trans)]))
 
                 grads, loss_theta_v, loss_c_v = self.clone_net.get_camous_grads(
-                    np.tile(np.expand_dims(new_camous, 0), [self._num_transforms, 1, 1, 1]), transform_encodings)
+                    np.tile(np.expand_dims(new_camous, 0), [self._num_transforms, 1, 1, 1]),
+                    self.transform_encodings, score_label_batch
+                )
+                if init_loss_theta_v is None:
+                    init_loss_theta_v = loss_theta_v
+                if loss_theta_v > 1.5 * init_loss_theta_v:
+                    # Stop to follow the clone network gradient, since the camous input already
+                    # enter the region that the clone network cannot fit the Simulator-Detector blackbox well
+                    self.print("Stop to follow the clone network gradient, since the camous input already "
+                               "enter the region that the clone network cannot fit the Simulator-Detector blackbox well. "
+                               "now fit(theta) loss: {:.3f} (init {:.3f})".format(loss_theta_v, init_loss_theta_v))
+                    break
                 grads = np.mean(grads[0], axis=0)
                 # TODO: attack maybe need momentum too..
                 if self.pgd:
@@ -593,7 +645,7 @@ class Attacker(object):
                 diff = new_camous - self.camous_history[-1]
                 linf_dist = np.max(np.abs(diff))
                 l2_dist = np.linalg.norm(diff)
-                self.print("[Optimize Camous] Iter {} (num eot transform={}) avg score: {}; mean loss theta: {}; mean loss c: {}; misdetect: {}/{}; diff: l2: {:.2f} linf: {:.2f}".format(
+                self.print("[Optimize Camous] Iter {} (num eot transform={}) avg score: {}; mean loss theta: {}; mean loss c: {}; misdetect: {}/{}; DIFF: l2: {:.2f} linf: {:.2f}".format(
                     i_inner, self._num_transforms, avg_score, loss_theta_v, loss_c_v, misdetect, self._num_transforms, l2_dist, linf_dist))
                 # display camous trace
                 self.simulator.render_camous_trace(new_camous, index=i_inner + 1)
@@ -606,17 +658,17 @@ class Attacker(object):
             # add random camous around the new camous, adjust camous weights
             # currently, use the same weights 1.0 for all the old camous
             self.camous_weights = [1.] * len(self.camous_history)
-            for _ in range(self.num_add_camous):
+            for _ in range(self.num_add_camous - 1):
                 noise = self.camous_std * np.random.randn(self.camous_size, self.camous_size, 3)
                 self.camous_history.append(np.clip(new_camous + noise, a_min=self.bounds[0], a_max=self.bounds[1]))
             self.camous_history.append(new_camous)
-            self.camous_weights = self.camous_weights + [10.] * (self.num_add_camous + 1)
+            self.camous_weights = self.camous_weights + [5.] * self.num_add_camous
 
             if len(self.camous_history) > self.num_max_camous:
                 self.camous_history = self.camous_history[-self.num_max_camous:]
                 self.camous_weights = self.camous_weights[-self.num_max_camous:]
 
-def main(device, model_file, sim_cfg, attacker_cfg, save_dir, display_info):
+def main(device, model_file, sim_cfg, attacker_cfg, save_dir, display_info, load_clone_net):
     os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
     tfconfig = tf.ConfigProto(allow_soft_placement=True)
     tfconfig.gpu_options.allow_growth = True
@@ -624,6 +676,7 @@ def main(device, model_file, sim_cfg, attacker_cfg, save_dir, display_info):
 
     detect_model = FasterRCNNModel(session)
     print("Constructed detect model")
+    # simulators = [CarlaSimulator(**sim_cfg) for sim_cfg in sim_cfgs]
     simulator = CarlaSimulator(**sim_cfg)
     print("Constructed simulator")
     attacker = Attacker(simulator, detect_model, session, save_dir, display_info, **attacker_cfg)
@@ -634,7 +687,7 @@ def main(device, model_file, sim_cfg, attacker_cfg, save_dir, display_info):
     print("Loaded detect model")
 
     print("Begin attack...")
-    attacker.run_attack()
+    attacker.run_attack(load_clone_net)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -645,6 +698,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-dir", required=True)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--display-info", action="store_true", default=False)
+    parser.add_argument("--load-clone-net", default=None)
     args = parser.parse_args()
     os.environ["DISPLAY"] = args.display
     if args.seed is not None:
@@ -657,7 +711,12 @@ if __name__ == "__main__":
     with open(args.cfg_file) as cf:
         cfgs = yaml.safe_load(cf)
 
+    if not os.path.exists(args.save_dir):
+        os.makedirs(args.save_dir)
+
+    shutil.copyfile(args.cfg_file, os.path.join(args.save_dir, "config.yaml"))
+
     main(args.device, args.detect_model, cfgs["simulator_cfg"], cfgs["attacker_cfg"],
-         args.save_dir, args.display_info)
+         args.save_dir, args.display_info, args.load_clone_net)
 
 
