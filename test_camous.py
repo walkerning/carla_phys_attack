@@ -616,7 +616,7 @@ class Attacker(object):
                 self.camous_weights = self.camous_weights[-self.num_max_camous:]
 
 
-def main(device, model_file, sim_cfgs, attacker_cfg, save_dir, display_info, load_clone_net):
+def main(device, model_file, sim_cfgs, attacker_cfg, save_dir, display_info, load_clone_net, gen_data_only):
     assert sim_cfgs
     os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
     tfconfig = tf.ConfigProto(allow_soft_placement=True)
@@ -632,8 +632,11 @@ def main(device, model_file, sim_cfgs, attacker_cfg, save_dir, display_info, loa
     detect_model.load(model_file)
     print("Loaded detect model")
 
-    print("Begin attack...")
-    attacker.run_attack(load_clone_net)
+    if not gen_data_only:
+        print("Begin attack...")
+        attacker.run_attack(load_clone_net)
+    else:
+        pass
 
 
 if __name__ == "__main__":
@@ -646,6 +649,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--display-info", action="store_true", default=False)
     parser.add_argument("--load-clone-net", default=None)
+    parser.add_argument("--gen-data-only", action="store_true", default=False)
     args = parser.parse_args()
     os.environ["DISPLAY"] = args.display
     if args.seed is not None:
@@ -664,4 +668,4 @@ if __name__ == "__main__":
     shutil.copyfile(args.cfg_file, os.path.join(args.save_dir, "config.yaml"))
 
     main(args.device, args.detect_model, cfgs["simulator_cfg"], cfgs["attacker_cfg"],
-         args.save_dir, args.display_info, args.load_clone_net)
+         args.save_dir, args.display_info, args.load_clone_net, args.gen_data_only)
