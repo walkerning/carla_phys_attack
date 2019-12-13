@@ -8,6 +8,7 @@ from config import cfg, config
 import os
 import random
 import shutil
+import cPickle
 import argparse
 from functools import partial
 
@@ -33,6 +34,25 @@ import network_desp
 import time
 
 _BATCH_NORM_EPSILON = 1e-5
+
+def _pickle_data(filename, data):
+    with open(filename, "wb") as wf:
+        cPickle.dump(data, wf)
+
+def _pickle_transforms(filename, transforms):
+    to_pickle = [[(transform.location.x, transform.location.y, transform.location.z),
+                  (transform.rotation.pitch, transform.rotation.roll, transform.rotation.yaw)]
+                 for transform in transforms]
+    with open(filename, "wb") as wf:
+        cPickle.dump(to_pickle, wf)
+
+def _load_pickle_transforms(filename):
+    with open(filename, "rb") as rf:
+        ts = cPickle.load(rf)
+    transforms = [carla.Transform(
+        carla.Location(**dict(zip(["x", "y", "z"], t[0]))),
+        carla.Rotation(**dict(zip(["pitch", "roll", "yaw"], t[1])))) for t in ts]
+    return transforms
 
 class AvgMeter(object):
     def __init(self):
@@ -422,14 +442,15 @@ class Attacker(object):
                         os.path.join(self.save_dir, "transform_encoding_{}_back.jpg".format(i)))
             _save_image(self.transform_encodings[-1][1],
                         os.path.join(self.save_dir, "transform_encoding_{}_fore.jpg".format(i)))
-        print("Clean detection scores for {} transforms: ".format(len(self.transforms)), self.clean_scores)
+        self.print("Clean detection scores for {} transforms: ".format(len(self.transforms)), self.clean_scores)
 
-    def get_epoch_cts(self):
+    def get_epoch_cts(self, total_to_gen=None):
         num_camous = len(self.camous_history)
-        if self.theta_max_num_ct_per_innerepoch is None:
-            total_to_gen = self._num_transforms * num_camous
-        else:
-            total_to_gen = self.theta_max_num_ct_per_innerepoch
+        if total_to_gen is None:
+            if self.theta_max_num_ct_per_innerepoch is None:
+                total_to_gen = self._num_transforms * num_camous
+            else:
+                total_to_gen = self.theta_max_num_ct_per_innerepoch
         if self.theta_random_ct_sample:
             c_inds = np.random.randint(low=0, high=num_camous, size=total_to_gen)
             t_inds = np.random.randint(low=0, high=self._num_transforms, size=total_to_gen)
@@ -439,7 +460,7 @@ class Attacker(object):
             transform_range = list(range(self._num_transforms))
             random.shuffle(camous_range)
             random.shuffle(transform_range)
-            c_inds = camous_range[:int(np.ceil(float(total_to_gen) / self._num_transforms))]
+            c_inds = camous_range[:(total_to_gen + self._num_transforms - 1) // self._num_transforms]
             return sum([[(c_ind, self.camous_history[c_ind], t_ind) for t_ind in transform_range]
                         for c_ind in c_inds], [])[:total_to_gen]
 
@@ -460,6 +481,53 @@ class Attacker(object):
     def _get_display_info(self, detbox, loss_meters, addis=[]):
         return ["score: {:.3f}".format(detbox.score)] + \
             ["{}: {:.3f} (avg {:.3f})".format(n, m.recent, m.avg) for n, m in loss_meters.items()] + addis
+
+    def gen_data(self, output_dir):
+        for _ in range(self.num_init_camous):
+            # generate init camouflages
+            self.camous_history.append((self.bounds[1] - self.bounds[0]) * \
+                                       np.random.rand(self.camous_size, self.camous_size, 3) + \
+                                       self.bounds[0])
+        # get all the cts
+        cts = self.get_epoch_cts(total_to_gen=self.num_init_camous * self._num_transforms)
+        self.simulator_pool.put_cts([[c, t_ind] for _, c, t_ind in cts])
+        BATCH_PER_FILE = 40
+        num_batches = len(self.simulator_pool)
+        iter_ = iter(self.simulator_pool)
+        parsed_batches = 0
+        parsed_num = 0
+        _pickle_data(os.path.join(output_dir, "camous_history.pkl"), self.camous_history)
+        _pickle_transforms(os.path.join(output_dir, "transforms.pkl"), self.transforms)
+        cs, ts = zip(*[(c_ind, t_ind) for c_ind, _, t_ind in cts])
+        file_id = 0
+        while 1:
+            start_time = time.time()
+            self.print("Start generating data {}".format(file_id))
+            file_name = os.path.join(output_dir, "data_batch_{}.pkl".format(file_id))
+            num_b_file = min(BATCH_PER_FILE, num_batches - parsed_batches)
+            images = np.concatenate([next(iter_) for _ in range(num_b_file)], axis=0)
+
+            scores = np.array([self.target_model.get_detbox(image).score for image in images])
+            num_datum = len(images)
+
+            elapsed_time = time.time() - start_time
+            self.print("Elpased {:.1f} s. Saving to {}".format(elapsed_time, file_name))
+            _pickle_data(file_name, {
+                "camous_ids": cs[parsed_num:parsed_num+num_datum],
+                "trans_ids": ts[parsed_num:parsed_num+num_datum],
+                "images": images,
+                "scores": scores
+            })
+            parsed_num += len(images)
+            parsed_batches += num_b_file
+            if parsed_batches >= num_batches:
+                break
+            file_id += 1
+
+        # camous list, transform list
+        # per data: camous_id, transform_id, rendered image, score
+        # return self.camous_history, self.transforms, cs, ts, images, scores
+
 
     def run_attack(self, load_clone_net=None):
         self.fix_detbox()
@@ -512,8 +580,9 @@ class Attacker(object):
                         camous_batch = np.stack([epoch_cts[_num][1] for _num in range(cur_num, end_num)])
 
                         # run update
-                        loss_v, loss_rec, loss_l2 = self.clone_net.accumulate_grads(camous_batch, transform_encodings, score_label_batch,
-                                                                                    loss_weight=loss_weight_batch)
+                        loss_v, loss_rec, loss_l2 = self.clone_net.accumulate_grads(
+                            camous_batch, transform_encodings, score_label_batch,
+                            loss_weight=loss_weight_batch)
                         self.clone_net.step(lr=cur_lr)
                         loss_v_meter.update(loss_v, self.batch_size)
                         loss_rec_meter.update(loss_rec, self.batch_size)
@@ -528,7 +597,8 @@ class Attacker(object):
                     # end epoch
                     self.print(("[Optimize Theta] Alter {}/Epoch {} total batches {} (bs={}): "
                                 "mean loss: {:.3f} {:.3f} {:.3f}; "
-                                "min det score using current camous set: {:.3f} (mean {:.3f})").format(
+                                "min det score using current camous set:"
+                                " {:.3f} (mean {:.3f})").format(
                                     i_iter, i_epoch, num_batches, self.batch_size,
                                     loss_v_meter.avg, loss_rec_meter.avg, loss_l2_meter.avg,
                                     det_score_meter.min, det_score_meter.avg))
@@ -536,7 +606,8 @@ class Attacker(object):
                         best_inner_i = i_epoch
                         best_inner_loss = loss_v_meter.avg
                     if i_epoch - best_inner_i >= self.theta_early_stop_window:
-                        print("mean loss does not decay for {} inner theta optimization iters, early-stop optimize theta".format(self.theta_early_stop_window))
+                        print("mean loss does not decay for {} inner theta optimization iters,"
+                              " early-stop optimize theta".format(self.theta_early_stop_window))
                         break
                 print("time for theta:", time.time() - start_time)
 
@@ -636,7 +707,9 @@ def main(device, model_file, sim_cfgs, attacker_cfg, save_dir, display_info, loa
         print("Begin attack...")
         attacker.run_attack(load_clone_net)
     else:
-        pass
+        # TODO: For now, only generate randomly
+        # maybe save and load the previous camous history, and tessellate around those points
+        attacker.gen_data(save_dir)
 
 
 if __name__ == "__main__":
