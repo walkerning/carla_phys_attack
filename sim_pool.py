@@ -53,6 +53,7 @@ class SimulatorPool(object):
         self.recv_idx = 0
         self.reorder_dict = {}
         self.int_reorder_dict = {}
+        self.epoch_delimiters = []
         self.workers = [
             multiprocessing.Process(
                 target=_worker_loop,
@@ -64,7 +65,9 @@ class SimulatorPool(object):
             w.start()
         atexit.register(self._shutdown)
 
-    def put_cts(self, ct_lst):
+    def put_cts(self, ct_lst, new_epoch=False):
+        if new_epoch:
+            self.epoch_delimiters.append(self.send_idx)
         for c, t in ct_lst:
             self.batch_ind_queue.put((self.send_idx, c, t))
             self.send_idx += 1
@@ -81,10 +84,14 @@ class SimulatorPool(object):
         return np.stack(batch)
 
     def __iter__(self):
+        # remove epoch_delimiters that is not needed anymore
+        next_epoch_del = np.where(np.array(self.epoch_delimiters) <= self.recv_idx)[0]
+        if len(next_epoch_del):
+            self.epoch_delimiters = self.epoch_delimiters[next_epoch_del[-1]+1:]
         return self
 
     def __len__(self):
-        num_data = self.send_idx - self.recv_idx
+        num_data = self._epoch_end_idx() - self.recv_idx
         return (num_data + self.batch_size - 1) // self.batch_size
 
     def _get_data_from_queue(self, idxes, data_queue, reorder_dct):
@@ -106,10 +113,19 @@ class SimulatorPool(object):
                     batch.append(image)
                     break
         return batch
-                    
+
+    def _epoch_end_idx(self):
+        next_epoch_del = np.where(np.array(self.epoch_delimiters) > self.recv_idx)[0]
+        if len(next_epoch_del):
+            epoch_end_idx = self.epoch_delimiters[next_epoch_del[0]]
+        else:
+            epoch_end_idx = self.send_idx
+        return epoch_end_idx
+
     def __next__(self):
         # return a batch of images
-        end_idx = min(self.recv_idx + self.batch_size, self.send_idx)
+        epoch_end_idx = self._epoch_end_idx()
+        end_idx = min(self.recv_idx + self.batch_size, epoch_end_idx)
         if end_idx <= self.recv_idx:
             raise StopIteration
         should_return_idxes = np.arange(self.recv_idx, end_idx)
@@ -187,6 +203,8 @@ if __name__ == "__main__":
     c_inds = np.concatenate([c_inds, [0] * 15])
     t_inds = np.concatenate([t_inds, np.arange(15)])
     sim_pool.put_cts([(camous_history[0], t_ind) for t_ind in range(num_transform)])
+    sim_pool.put_cts([(camous_history[2], t_ind) for t_ind in range(num_transform-1)], new_epoch=True)
+
     assert len(sim_pool) == 1
     batches += [batch for batch in sim_pool]
     assert len(batches[-1]) == 15
@@ -195,6 +213,13 @@ if __name__ == "__main__":
      for i, c in enumerate(camous_history)]
     [_save_image(im, "test_sim_pool_images/sim_pic_c{}_t{}.jpg".format(c_ind, t_ind))
      for im, c_ind, t_ind in zip(batches, c_inds, t_inds)]
+    # next epoch
+    assert len(sim_pool) == 1
+    assert len(sim_pool.epoch_delimiters) == 1
+    batch = next(iter(sim_pool))
+    assert not sim_pool.epoch_delimiters
+    assert len(batches[-1]) == 14
+
     
     # try method `get_images`
     camous1_images = sim_pool.get_images([(camous_history[1], t_ind) for t_ind in range(num_transform)])

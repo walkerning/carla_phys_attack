@@ -358,6 +358,7 @@ class Attacker(object):
                      "decay_epoch_every": -1,
                      "decay_epoch_rate": 1.0
                  },
+                 valid_ratio=0.1,
                  # camous optimization hyperparameters
                  c_optimize_iters=20, lr_c=2.0, pgd=True,
                  clone_net_cfg=None,
@@ -385,6 +386,7 @@ class Attacker(object):
         self.num_add_camous = num_add_camous
         self.clone_net_cfg = clone_net_cfg or {}
         self.lr_theta_scheduler = globals()[lr_theta_type + "LrScheduler"](**lr_theta_cfg)
+        self.valid_ratio = valid_ratio
         self.lr_c = lr_c
         self.pgd = pgd
         self.theta_early_stop_window = theta_early_stop_window
@@ -646,7 +648,7 @@ class Attacker(object):
                                "now fit(theta) loss: {:.3f} (init {:.3f})".format(loss_theta_v, init_loss_theta_v))
                     break
                 grads = np.mean(grads[0], axis=0)
-                # TODO: attack maybe need momentum
+                # TODO: attack maybe need momentum and 2-order momentum of gradients
                 if self.pgd:
                     direct = np.sign(grads)
                 else:
