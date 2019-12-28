@@ -155,12 +155,13 @@ if __name__ == "__main__":
     sim_cfgs = [{
         "gpu": 0,
         "port": 22000,
+        # "already_started": True
         #"simulator_id": "try1"
-    }, {
-        "gpu": 2,
-        "port": 22010,
-        # "simulator_id": "try2"
-    }
+    }# , {
+    #     "gpu": 2,
+    #     "port": 22010,
+    #     # "simulator_id": "try2"
+    # }
     ]
 
     camous_history = [255 * np.random.rand(16, 16, 3) for _ in range(10)]

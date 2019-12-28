@@ -296,8 +296,15 @@ class CarlaSimulator(object):
         return self.last_image
 
     def _retrieve_data(self, sensor_queue, timeout):
+        try_times = 0
         while True:
-            data, frame = sensor_queue.get(timeout=timeout)
+            try:
+                data, frame = sensor_queue.get(timeout=timeout)
+            except queue.Empty:
+                try_times += 1
+                if try_times > 3:
+                    raise
+                continue
             if frame == self.frame:
                 return data.copy()
 
